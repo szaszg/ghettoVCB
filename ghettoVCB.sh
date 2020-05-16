@@ -81,6 +81,10 @@ NFS_LOCAL_NAME=backup
 # Name of backup directory for VMs residing on the NFS volume
 NFS_VM_BACKUP_DIR=mybackups
 
+# ignore ghettoVCB.noBackup and ghettoVCB.excludeDisk options
+#   if -x command line switch supplied
+IGNORE_VMX_OPTIONS=0
+
 ##########################################################
 # EMAIL CONFIGURATIONS
 #
@@ -190,11 +194,12 @@ printUsage() {
         echo "OPTIONS:"
         echo "   -a     Backup all VMs on host"
         echo "   -f     List of VMs to backup"
-        echo "   -m     Name of VM to backup (overrides -f)"
+        echo "   -m     Name of VM to backup (overrides -f and options in .vmx)"
         echo "   -c     VM configuration directory for VM backups"
         echo "   -g     Path to global ghettoVCB configuration file"
         echo "   -l     File to output logging"
         echo "   -w     ghettoVCB work directory (default: /tmp/ghettoVCB.work)"
+        echo "   -x     ignore options in .vmx files"
         echo "   -d     Debug level [info|debug|dryrun] (default: info)"
         echo
         echo "(e.g.)"
@@ -214,6 +219,11 @@ printUsage() {
         echo -e "\t$0 -f vms_to_backup -l /vmfs/volume/local-storage/ghettoVCB.log"
         echo -e "\nDry run (no backup will take place)"
         echo -e "\t$0 -f vms_to_backup -d dryrun"
+        echo
+        echo "NOTE:"
+        echo "   .vmx file options (Settings->VM Options->Advanced, Edit configuration)"
+        echo "      ghettoVCB.noBackup = \"Yes\" -- do not backup this VM"
+        echo "      ghettoVCB.excludeDisk = \"scsi0:1 ide0:2\" -- do not backup listed disks"
         echo
 }
 
@@ -458,8 +468,14 @@ findVMDK() {
 getVMDKs() {
     #get all VMDKs listed in .vmx file
     VMDKS_FOUND=$(grep -iE '(^scsi|^ide|^sata|^nvme)' "${VMX_PATH}" | grep -i fileName | awk -F " " '{print $1}')
+    #get excluded VMDK's listed in .vmx file ghettoVCB.excludeDisk
+    if [[ "${IGNORE_VMX_OPTIONS}" -ne 1 ]]; then
+        VMDKS_EXCLUDE="::$(grep -iE 'ghettoVCB.excludeDisk' "${VMX_PATH}" | awk -F "\"" '{$0 = $2; gsub(/ +/, "::"); print}')::"
+        logger "debug" "getVMDKs() exclude disk list: $VMDKS_EXCLUDE"
+    fi
 
     VMDKS=
+    VMDKS_EXCLD=
     INDEP_VMDKS=
 
     TMP_IFS=${IFS}
@@ -468,6 +484,11 @@ getVMDKs() {
     for DISK in ${VMDKS_FOUND}; do
         #extract the SCSI ID and use it to check for valid vmdk disk
         SCSI_ID=$(echo ${DISK%%.*})
+        if echo "${VMDKS_EXCLUDE}" | grep -q "::${SCSI_ID}::"; then
+            VMDK_EXCLUDE_THIS=1
+        else
+            VMDK_EXCLUDE_THIS=0
+        fi
         grep -i "^${SCSI_ID}.present" "${VMX_PATH}" | grep -i "true" > /dev/null 2>&1
 
         #if valid, then we use the vmdk file
@@ -489,8 +510,12 @@ getVMDKs() {
                     fi
 
                     DISK_SIZE=$(echo "${DISK_SIZE_IN_SECTORS}" | awk '{printf "%.0f\n",$1*512/1024/1024/1024}')
-                    VMDKS="${DISK}###${DISK_SIZE}:${VMDKS}"
-                    TOTAL_VM_SIZE=$((TOTAL_VM_SIZE+DISK_SIZE))
+                    if [[ $VMDK_EXCLUDE_THIS = 0 ]]; then
+                        VMDKS="${FILE_NAME}###${DISK_SIZE}:${VMDKS}"
+                        TOTAL_VM_SIZE=$((TOTAL_VM_SIZE+DISK_SIZE))
+                    else
+                        VMDKS_EXCLD="${FILE_NAME}###${DISK_SIZE}:${VMDKS_EXCLD}"
+                    fi
                 else
                     #if the deviceType is NULL for IDE which it is, thanks for the inconsistency VMware
                     #we'll do one more level of verification by checking to see if an ext. of .vmdk exists
@@ -506,8 +531,12 @@ getVMDKs() {
                             DISK_SIZE_IN_SECTORS=$(cat "${VMX_DIR}/${DISK}" | grep "VMFS" | grep ".vmdk" | awk '{print $2}')
                         fi
                         DISK_SIZE=$(echo "${DISK_SIZE_IN_SECTORS}" | awk '{printf "%.0f\n",$1*512/1024/1024/1024}')
-                        VMDKS="${DISK}###${DISK_SIZE}:${VMDKS}"
-                        TOTAL_VM_SIZE=$((TOTAL_VM_SIZE_IN+DISK_SIZE))
+                        if [[ $VMDK_EXCLUDE_THIS = 0 ]]; then
+                            VMDKS="${FILE_NAME}###${DISK_SIZE}:${VMDKS}"
+                            TOTAL_VM_SIZE=$((TOTAL_VM_SIZE_IN+DISK_SIZE))
+                        else
+                            VMDKS_EXCLD="${FILE_NAME}###${DISK_SIZE}:${VMDKS_EXCLD}"
+                        fi
                     fi
                 fi
 
@@ -978,6 +1007,11 @@ ghettoVCB() {
         if [[ ! -z ${VM_ID} ]] && [[ "${LOG_LEVEL}" != "dryrun" ]]; then
             storageInfo "before"
         fi
+        #get VM excluded in .vmx file ghettoVCB.noBackup = True|Yes|1
+        # we check .vmx file for noBackup unless already ignore, ignore vmx options (-x) or select a VM (-m)
+        if [[ "${IGNORE_VM}" -ne 1 ]] && [[ "${IGNORE_VMX_OPTIONS}" -ne 1 ]] && [[ -z "${VM_ARG}" ]] ; then
+            grep -iF 'ghettoVCB.noBackup' "${VMX_PATH}" | grep -q -iE '(True|Yes|1)' && IGNORE_VM=1
+        fi
 
         #ignore VM as it's in the exclusion list or was on problem list
         if [[ "${IGNORE_VM}" -eq 1 ]] ; then
@@ -1003,6 +1037,14 @@ ghettoVCB() {
             OLD_IFS="${IFS}"
             IFS=":"
             for j in ${VMDKS}; do
+                J_VMDK=$(echo "${j}" | awk -F "###" '{print $1}')
+                J_VMDK_SIZE=$(echo "${j}" | awk -F "###" '{print $2}')
+                logger "dryrun" "\t${J_VMDK}\t${J_VMDK_SIZE} GB"
+            done
+            logger "dryrun" "VMDK(s) excluded by config: "
+            OLD_IFS="${IFS}"
+            IFS=":"
+            for j in ${VMDKS_EXCLD}; do
                 J_VMDK=$(echo "${j}" | awk -F "###" '{print $1}')
                 J_VMDK_SIZE=$(echo "${j}" | awk -F "###" '{print $2}')
                 logger "dryrun" "\t${J_VMDK}\t${J_VMDK_SIZE} GB"
@@ -1557,7 +1599,7 @@ if [[ "${EMAIL_FROM%%@*}" == "" ]] ; then
 fi
 
 #read user input
-while getopts ":af:c:g:w:m:l:d:e:" ARGS; do
+while getopts ":af:c:g:w:m:l:d:e:x" ARGS; do
     case $ARGS in
         w)
             WORKDIR="${OPTARG}"
@@ -1590,6 +1632,9 @@ while getopts ":af:c:g:w:m:l:d:e:" ARGS; do
             ;;
         d)
             LOG_LEVEL="${OPTARG}"
+            ;;
+        x)
+            IGNORE_VMX_OPTIONS=1
             ;;
         :)
             echo "Option -${OPTARG} requires an argument."
