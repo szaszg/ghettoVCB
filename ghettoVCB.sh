@@ -455,9 +455,19 @@ findVMDK() {
     #fi
 }
 
+# if -n $1 we get VMDKs from .vmsd file $1 is snapshotXXX
 getVMDKs() {
-    #get all VMDKs listed in .vmx file
-    VMDKS_FOUND=$(grep -iE '(^scsi|^ide|^sata|^nvme)' "${VMX_PATH}" | grep -i fileName | awk -F " " '{print $1}')
+    WITHSNAPS=$1
+    if [[ -n "$WITHSNAPS" ]]; then
+        #we have to backup all disk in .vmsd file
+        VMDKS_FOUND=$(grep -iE "^snapshot[0-9]+\.disk[0-9]+\.node" "${VMSD_PATH}" | awk -F "\"" '{print $1"."$2}' | awk -F "." '{print $1"."$2}')
+        ## snapshot0.disk12
+        logger "info" "EXPERIMENTAL - get VMDKs from ${VMSD_PATH##*/}"
+    else
+        #get all VMDKs listed in .vmx file
+        VMDKS_FOUND=$(grep -iE '(^scsi|^ide|^sata|^nvme)' "${VMX_PATH}" | grep -i fileName | awk -F " " '{print $1}')
+        ## scsi0:3.fileName
+    fi
 
     VMDKS=
     INDEP_VMDKS=
@@ -467,7 +477,13 @@ getVMDKs() {
     #loop through each disk and verify that it's currently present and create array of valid VMDKS
     for DISK in ${VMDKS_FOUND}; do
         #extract the SCSI ID and use it to check for valid vmdk disk
-        SCSI_ID=$(echo ${DISK%%.*})
+        if [[ -n "$WITHSNAPS" ]]; then
+            SCSI_ID=$(grep -i "^${DISK}\.node" "${VMSD_PATH}" |  awk -F "\"" '{print $2}')
+            FILE_NAME=$(grep -i "^${DISK}\.fileName" "${VMSD_PATH}" | awk -F "\"" '{print $2}')
+        else
+            SCSI_ID=$(echo ${DISK%%.*})
+            FILE_NAME=$(grep -i "^${SCSI_ID}.fileName" "${VMX_PATH}" | awk -F "\"" '{print $2}')
+        fi
         grep -i "^${SCSI_ID}.present" "${VMX_PATH}" | grep -i "true" > /dev/null 2>&1
 
         #if valid, then we use the vmdk file
@@ -479,17 +495,17 @@ getVMDKs() {
 
                 #if we find the device type is of scsi-disk, then proceed
                 if [[ $? -eq 0 ]]; then
-                    DISK=$(grep -i "^${SCSI_ID}.fileName" "${VMX_PATH}" | awk -F "\"" '{print $2}')
-                    echo "${DISK}" | grep "\/vmfs\/volumes" > /dev/null 2>&1
+#                    DISK=$(grep -i "^${SCSI_ID}.fileName" "${VMX_PATH}" | awk -F "\"" '{print $2}')
+                    echo "${FILE_NAME}" | grep "\/vmfs\/volumes" > /dev/null 2>&1
 
                     if [[ $? -eq 0 ]]; then
-                        DISK_SIZE_IN_SECTORS=$(cat "${DISK}" | grep "VMFS" | grep ".vmdk" | awk '{print $2}')
+                        DISK_SIZE_IN_SECTORS=$(cat "${FILE_NAME}" | grep "VMFS" | grep ".vmdk" | awk '{print $2}')
                     else
-                        DISK_SIZE_IN_SECTORS=$(cat "${VMX_DIR}/${DISK}" | grep "VMFS" | grep ".vmdk" | awk '{print $2}')
+                        DISK_SIZE_IN_SECTORS=$(cat "${VMX_DIR}/${FILE_NAME}" | grep "VMFS" | grep ".vmdk" | awk '{print $2}')
                     fi
 
                     DISK_SIZE=$(echo "${DISK_SIZE_IN_SECTORS}" | awk '{printf "%.0f\n",$1*512/1024/1024/1024}')
-                    VMDKS="${DISK}###${DISK_SIZE}:${VMDKS}"
+                    VMDKS="${FILE_NAME}###${DISK_SIZE}:${VMDKS}"
                     TOTAL_VM_SIZE=$((TOTAL_VM_SIZE+DISK_SIZE))
                 else
                     #if the deviceType is NULL for IDE which it is, thanks for the inconsistency VMware
@@ -497,31 +513,33 @@ getVMDKs() {
                     #since we can not rely on the deviceType showing "ide-hardDisk"
                     grep -i "^${SCSI_ID}.fileName" "${VMX_PATH}" | grep -i ".vmdk" > /dev/null 2>&1
 
-                    if [[ $? -eq 0 ]]; then
-                        DISK=$(grep -i "^${SCSI_ID}.fileName" "${VMX_PATH}" | awk -F "\"" '{print $2}')
-                        echo "${DISK}" | grep "\/vmfs\/volumes" > /dev/null 2>&1
+                    #if works from .vmsd always have... [ -n $1 ]
+                    if [[ -n "$WITHSNAPS" ]] || [[ $? -eq 0 ]]; then
+#                        DISK=$(grep -i "^${SCSI_ID}.fileName" "${VMX_PATH}" | awk -F "\"" '{print $2}')
+                        echo "${FILE_NAME}" | grep "\/vmfs\/volumes" > /dev/null 2>&1
                         if [[ $? -eq 0 ]]; then
-                            DISK_SIZE_IN_SECTORS=$(cat "${DISK}" | grep "VMFS" | grep ".vmdk" | awk '{print $2}')
+                            DISK_SIZE_IN_SECTORS=$(cat "${FILE_NAME}" | grep "VMFS" | grep ".vmdk" | awk '{print $2}')
                         else
-                            DISK_SIZE_IN_SECTORS=$(cat "${VMX_DIR}/${DISK}" | grep "VMFS" | grep ".vmdk" | awk '{print $2}')
+                            DISK_SIZE_IN_SECTORS=$(cat "${VMX_DIR}/${FILE_NAME}" | grep "VMFS" | grep ".vmdk" | awk '{print $2}')
                         fi
                         DISK_SIZE=$(echo "${DISK_SIZE_IN_SECTORS}" | awk '{printf "%.0f\n",$1*512/1024/1024/1024}')
-                        VMDKS="${DISK}###${DISK_SIZE}:${VMDKS}"
+                        VMDKS="${FILE_NAME}###${DISK_SIZE}:${VMDKS}"
                         TOTAL_VM_SIZE=$((TOTAL_VM_SIZE_IN+DISK_SIZE))
                     fi
                 fi
 
             else
                 #independent disks are not affected by snapshots, hence they can not be backed up
-                DISK=$(grep -i "^${SCSI_ID}.fileName" "${VMX_PATH}" | awk -F "\"" '{print $2}')
-                echo "${DISK}" | grep "\/vmfs\/volumes" > /dev/null 2>&1
+                # so we never encounter an independent disk in .vmsd (?)
+#                DISK=$(grep -i "^${SCSI_ID}.fileName" "${VMX_PATH}" | awk -F "\"" '{print $2}')
+                echo "${FILE_NAME}" | grep "\/vmfs\/volumes" > /dev/null 2>&1
                 if [[ $? -eq 0 ]]; then
-                    DISK_SIZE_IN_SECTORS=$(cat "${DISK}" | grep "VMFS" | grep ".vmdk" | awk '{print $2}')
+                    DISK_SIZE_IN_SECTORS=$(cat "${FILE_NAME}" | grep "VMFS" | grep ".vmdk" | awk '{print $2}')
                 else
-                    DISK_SIZE_IN_SECTORS=$(cat "${VMX_DIR}/${DISK}" | grep "VMFS" | grep ".vmdk" | awk '{print $2}')
+                    DISK_SIZE_IN_SECTORS=$(cat "${VMX_DIR}/${FILE_NAME}" | grep "VMFS" | grep ".vmdk" | awk '{print $2}')
                 fi
                 DISK_SIZE=$(echo "${DISK_SIZE_IN_SECTORS}" | awk '{printf "%.0f\n",$1*512/1024/1024/1024}')
-                INDEP_VMDKS="${DISK}###${DISK_SIZE}:${INDEP_VMDKS}"
+                INDEP_VMDKS="${FILE_NAME}###${DISK_SIZE}:${INDEP_VMDKS}"
             fi
         fi
     done
@@ -973,6 +991,7 @@ ghettoVCB() {
         VMX_CONF=$(grep -E "\"${VM_NAME}\"" ${WORKDIR}/vms_list | awk -F ";" '{print $4}' | sed 's/\[//;s/\]//;s/"//g')
         VMX_PATH="/vmfs/volumes/${VMFS_VOLUME}/${VMX_CONF}"
         VMX_DIR=$(dirname "${VMX_PATH}")
+        VMSD_PATH="${VMX_PATH%.*}.vmsd"
 
         #storage info
         if [[ ! -z ${VM_ID} ]] && [[ "${LOG_LEVEL}" != "dryrun" ]]; then
@@ -994,6 +1013,7 @@ ghettoVCB() {
             logger "dryrun" "VMX_PATH: $VMX_PATH"
             logger "dryrun" "VMX_DIR: $VMX_DIR"
             logger "dryrun" "VMX_CONF: $VMX_CONF"
+            logger "dryrun" "VMSD_PATH: $VMSD_PATH"
             logger "dryrun" "VMFS_VOLUME: $VMFS_VOLUME"
             logger "dryrun" "VMDK(s): "
 
@@ -1032,6 +1052,8 @@ ghettoVCB() {
                 if [ ${ALLOW_VMS_WITH_SNAPSHOTS_TO_BE_BACKEDUP} -eq 0 ]; then
                     logger "dryrun" "Snapshots found for this VM, please commit all snapshots before continuing!"
                     logger "dryrun" "THIS VIRTUAL MACHINE WILL NOT BE BACKED UP DUE TO EXISTING SNAPSHOTS!"
+                elif [ ${ALLOW_VMS_WITH_SNAPSHOTS_TO_BE_BACKEDUP} -eq 2 ]; then
+                    logger "dryrun" "Snapshots found for this VM, TRY TO PRESERVE (experimental)!"
                 else
                     logger "dryrun" "Snapshots found for this VM, ALL EXISTING SNAPSHOTS WILL BE CONSOLIDATED PRIOR TO BACKUP!"
                 fi
@@ -1043,8 +1065,11 @@ ghettoVCB() {
             logger "dryrun" "###############################################\n"
 
         #checks to see if the VM has any snapshots to start with
+        # snapshot detection: grep .vmsd
         elif [[ -f "${VMX_PATH}" ]] && [[ ! -z "${VMX_PATH}" ]]; then
-            if ls "${VMX_DIR}" | grep -q "\-delta\.vmdk" > /dev/null 2>&1; then
+            NUM_SNAPS=$(cat "${VMSD_PATH}" 2>&1 | grep -iF "snapshot.numSnapshots" | awk -F "\"" '{ print $2}')
+            [[ -z "${NUM_SNAPS}" ]] && NUM_SNAPS=0
+            if [[ ${NUM_SNAPS} -gt 0 ]] || ls "${VMX_DIR}" | grep -q "\-delta\.vmdk" > /dev/null 2>&1; then
                 if [ ${ALLOW_VMS_WITH_SNAPSHOTS_TO_BE_BACKEDUP} -eq 0 ]; then
                     logger "error" "Snapshot found for ${VM_NAME}, backup will not take place\n"
                     VM_FAILED=1
@@ -1052,9 +1077,12 @@ ghettoVCB() {
                 elif [ ${ALLOW_VMS_WITH_SNAPSHOTS_TO_BE_BACKEDUP} -eq 1 ]; then
                     logger "info" "Snapshot found for ${VM_NAME}, consolidating ALL snapshots now (this can take awhile) ...\n"
                     $VMWARE_CMD vmsvc/snapshot.removeall ${VM_ID} > /dev/null 2>&1
+                elif [ ${ALLOW_VMS_WITH_SNAPSHOTS_TO_BE_BACKEDUP} -eq 2 ]; then
+                    #preserve snapshots
+                    logger "info" "Snapshot found for ${VM_NAME}, preserving snapshots ...\n"
                 fi
             fi
-    	    #nfs case and backup to root path of your NFS mount
+            #nfs case and backup to root path of your NFS mount
             if [[ ${ENABLE_NON_PERSISTENT_NFS} -eq 1 ]] ; then
                 BACKUP_DIR="/vmfs/volumes/${NFS_LOCAL_NAME}/${NFS_VM_BACKUP_DIR}/${VM_NAME}"
                 if [[ -z ${VM_NAME} ]] || [[ -z ${NFS_LOCAL_NAME} ]] || [[ -z ${NFS_VM_BACKUP_DIR} ]]; then
@@ -1094,6 +1122,7 @@ ghettoVCB() {
             mkdir -p "${VM_BACKUP_DIR}"
 
             cp "${VMX_PATH}" "${VM_BACKUP_DIR}"
+            cp "${VMSD_PATH}" "${VM_BACKUP_DIR}"
 
             #new variable to keep track on whether VM has independent disks
             VM_HAS_INDEPENDENT_DISKS=0
@@ -1133,7 +1162,7 @@ ghettoVCB() {
                     logger "debug" "Waiting for snapshot \"${SNAPSHOT_NAME}\" to be created"
                     logger "debug" "Snapshot timeout set to: $((SNAPSHOT_TIMEOUT*60)) seconds"
                     START_ITERATION=0
-                    while [[ $(${VMWARE_CMD} vmsvc/snapshot.get ${VM_ID} | wc -l) -eq 1 ]]; do
+                    while [[ $(${VMWARE_CMD} vmsvc/snapshot.get ${VM_ID} | grep -c -F "\"${SNAPSHOT_NAME}\"") -ge 1 ]]; do
                         if [[ ${START_ITERATION} -ge ${SNAPSHOT_TIMEOUT} ]] ; then
                             logger "info" "Snapshot timed out, failed to create snapshot: \"${SNAPSHOT_NAME}\" for ${VM_NAME}"
                             SNAP_SUCCESS=0
@@ -1149,6 +1178,9 @@ ghettoVCB() {
                 fi
 
                 if [[ ${SNAP_SUCCESS} -eq 1 ]] ; then
+                    if [[ $NUM_SNAPS -gt 0 && ${ALLOW_VMS_WITH_SNAPSHOTS_TO_BE_BACKEDUP} -eq 2 ]]; then
+                        getVMDKs WITHSNAPS
+                    fi
                     OLD_IFS="${IFS}"
                     IFS=":"
                     for j in ${VMDKS}; do
